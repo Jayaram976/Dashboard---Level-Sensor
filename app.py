@@ -1,191 +1,69 @@
 from flask import Flask, request, jsonify
-import sqlite3
 from datetime import datetime
-import requests
-import time
 
-# Serve static files from ./static
 app = Flask(__name__, static_folder="static", static_url_path="")
 
-# -----------------------------
-# Database connection
-# -----------------------------
-def db_connection():
-    return sqlite3.connect("database.db")
+# In-memory storage
+sensor_data = {}
 
-# -----------------------------
-# Create table (run once)
-# -----------------------------
-conn = db_connection()
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS sensor_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT,
-    timestamp TEXT,
-    level REAL,
-    temperature REAL,
-    angle REAL,
-    alarmLevel INTEGER,
-    alarmFire INTEGER,
-    alarmFall INTEGER,
-    alarmBattery INTEGER,
-    frameCounter INTEGER
-)
-""")
-conn.commit()
-conn.close()
+@app.route("/")
+def index():
+    return app.send_static_file("index.html")
 
-# -----------------------------
-# RECEIVE DATA FROM DINGTEK / TCP SERVER
-# -----------------------------
+
 @app.route("/dingtek", methods=["POST"])
-def receive_data():
-    # Accept JSON or form-encoded payloads and be flexible with the IP key
-    data = None
+def receive_dingtek():
     try:
-        data = request.get_json(silent=True)
-    except Exception:
-        data = None
-
-    if not data or not isinstance(data, dict):
+        # 1️⃣ Try form data first (most Dingtek devices)
         if request.form:
-            data = request.form.to_dict()
+            raw_dict = request.form.to_dict()
         else:
-            raw = request.data.decode('utf-8', errors='ignore')
-            if raw:
-                try:
-                    import json
-                    data = json.loads(raw)
-                except Exception:
-                    data = {}
-            else:
-                data = {}
+            raw_text = request.get_data(as_text=True).strip()
+            raw_dict = {}
 
-    if not data:
-        return jsonify({"error": "No payload received"}), 400
+            if raw_text:
+                parts = raw_text.replace("&", ",").split(",")
+                for p in parts:
+                    if "=" in p:
+                        k, v = p.split("=", 1)  # SAFE split
+                        raw_dict[k.strip()] = v.strip()
 
-    # Accept several possible keys for the device IP
-    ip = data.get("device_ip") or data.get("ip") or data.get("IP") or data.get("deviceIp")
+        if not raw_dict:
+            return jsonify({"error": "No valid data received"}), 400
 
-    if not ip:
-        return jsonify({"error": "device_ip (or ip) missing"}), 400
+        device_id = request.args.get("id", "DINGTEK-001")
 
-    conn = db_connection()
-    cursor = conn.cursor()
+        sensor_data[device_id] = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "level": raw_dict.get("level", raw_dict.get("lvl", "-")),
+            "temperature": raw_dict.get("temp", raw_dict.get("temperature", "-")),
+            "angle": raw_dict.get("angle", "-"),
+            "battery": raw_dict.get("bat", raw_dict.get("battery", "-")),
+            "fire": 0,
+            "fall": 0,
+            "frame": 1
+        }
 
-    cursor.execute("""
-        INSERT INTO sensor_data
-        (ip, timestamp, level, temperature, angle,
-         alarmLevel, alarmFire, alarmFall, alarmBattery, frameCounter)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        ip,
-        data.get("timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        data.get("level"),
-        data.get("temperature"),
-        data.get("angle"),
-        data.get("alarmLevel", 0),
-        data.get("alarmFire", 0),
-        data.get("alarmFall", 0),
-        data.get("alarmBattery", 0),
-        data.get("frameCounter", 0)
-    ))
+        return jsonify({"status": "received"}), 200
 
-    conn.commit()
-    conn.close()
-
-    print(f"✅ Data received from {ip}")
-    print("Payload:", data)
-
-    return jsonify({"status": "received"})
-
-# -----------------------------
-# DASHBOARD API (READ DATA)
-# -----------------------------
-@app.route("/api/data")
-def get_data():
-    ip = request.args.get("ip")
-    if not ip:
-        return jsonify([])
-
-    conn = db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT timestamp, level, temperature, angle,
-               alarmLevel, alarmFire, alarmFall, alarmBattery, frameCounter
-        FROM sensor_data
-        WHERE ip=?
-        ORDER BY id DESC
-        LIMIT 50
-    """, (ip,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    result = []
-    for r in rows:
-        result.append({
-            "timestamp": r[0],
-            "level": r[1],
-            "temperature": r[2],
-            "angle": r[3],
-            "alarmLevel": r[4],
-            "alarmFire": r[5],
-            "alarmFall": r[6],
-            "alarmBattery": r[7],
-            "frameCounter": r[8]
-        })
-
-    return jsonify(result)
+    except Exception as e:
+        print("ERROR:", str(e))
+        return jsonify({"error": "server error"}), 500
 
 
 @app.route("/api/ips")
 def get_ips():
-    conn = db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT ip FROM sensor_data WHERE ip IS NOT NULL AND ip != '' ORDER BY ip")
-    rows = cursor.fetchall()
-    conn.close()
+    return jsonify(list(sensor_data.keys()))
 
-    ips = [r[0] for r in rows]
-    return jsonify(ips)
 
-# -----------------------------
-# SERVE DASHBOARD
-# -----------------------------
-@app.route("/")
-def dashboard():
-    return app.send_static_file("index.html")
+@app.route("/api/data")
+def get_data():
+    ip = request.args.get("ip")
+    if ip in sensor_data:
+        return jsonify(sensor_data[ip])
+    return jsonify({})
 
-@app.route("/favicon.ico")
-def favicon():
-    return "", 204
 
-# -----------------------------
-# CLOUD API INTEGRATION
-# -----------------------------
-CLOUD_API = "https://cloud.dingtek.com/api/devices/<device_id>/data"
-HEADERS = {"Authorization":"Bearer YOUR_TOKEN"}
-
-def fetch_and_store():
-    r = requests.get(CLOUD_API, headers=HEADERS)
-    data = r.json()
-    # parse device payload and insert into database.db (same schema)
-
-# -----------------------------
-# START SERVER
-# -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=True)
 
-{
-  "device_ip": "199.36.158.10",
-  "level": 1.23,
-  "temperature": 25.0,
-  "angle": 3.5,
-  "alarmLevel": 0,
-  "alarmFire": 0,
-  "alarmFall": 0,
-  "alarmBattery": 0,
-  "frameCounter": 123
-}
